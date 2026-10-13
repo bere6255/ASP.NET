@@ -1,0 +1,55 @@
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    env_file:
+      - .env
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${SQL_SA_PASSWORD:?Set SQL_SA_PASSWORD in .env}
+    ports:
+      - "1433:1433"
+    volumes:
+      - sql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+  redis:
+    image: redis:7-alpine
+    env_file:
+      - .env
+    command: ["sh", "-c", "redis-server --requirepass \"$${REDIS_PASSWORD}\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -a \"$${REDIS_PASSWORD}\" ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RabbitMq__UserName:?Set RabbitMq__UserName in .env}
+      RABBITMQ_DEFAULT_PASS: ${RabbitMq__Password:?Set RabbitMq__Password in .env}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+volumes:
+  sql-data:
+  redis-data:
+  rabbitmq-data:
