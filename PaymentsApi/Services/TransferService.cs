@@ -29,6 +29,10 @@ public sealed class TransferService(
     public async Task<(TransferReceipt Receipt, int StatusCode)> TransferAsync(
         Guid userId, string idempotencyKey, TransferRequest request, CancellationToken cancellationToken)
     {
+        // 1. Guard against self-transfers (source and destination cannot be the same)
+        if (request.FromAccountId == request.ToAccountId)
+            throw new UnprocessableException("Cannot transfer funds to the same account.");
+
         var requestHash = HashRequest(request);
         var cached = await cache.GetStringAsync(CacheKey(idempotencyKey), cancellationToken);
         if (cached is not null)
@@ -64,12 +68,15 @@ public sealed class TransferService(
             if (existing is not null)
                 return existing.Value;
 
+            // 2. Fetch and order accounts by ID to eliminate SQL deadlocks under concurrent load
             var accounts = await dbContext.Accounts
                 .Where(account => account.Id == request.FromAccountId || account.Id == request.ToAccountId)
                 .OrderBy(account => account.Id)
                 .ToListAsync(cancellationToken);
+
             var source = accounts.SingleOrDefault(account => account.Id == request.FromAccountId);
             var destination = accounts.SingleOrDefault(account => account.Id == request.ToAccountId);
+            
             if (source is null || destination is null)
                 throw new NotFoundException("One or more accounts were not found.");
             if (source.UserId != userId)
@@ -80,8 +87,10 @@ public sealed class TransferService(
             var reference = Guid.NewGuid().ToString("N");
             var outgoing = NewTransaction(reference, source.Id, request.Amount, "Debit", idempotencyKey);
             var incoming = NewTransaction(reference + "-C", destination.Id, request.Amount, "Credit", idempotencyKey);
+            
             source.Balance -= request.Amount;
             destination.Balance += request.Amount;
+            
             var receipt = new TransferReceipt(reference, request.Amount, "Completed");
             var response = ApiResponse<TransferReceipt>.Ok(receipt, "Transfer completed.");
             var responseBody = JsonSerializer.Serialize(response);
@@ -99,6 +108,7 @@ public sealed class TransferService(
                         ResponseBody = responseBody,
                         StatusCode = result.StatusCode
                     });
+                    
                     await dbContext.SaveChangesAsync(cancellationToken);
                     await sqlTransaction.CommitAsync(cancellationToken);
                 }
@@ -110,9 +120,11 @@ public sealed class TransferService(
             }
 
             await CacheResultAsync(idempotencyKey, requestHash, result, cancellationToken);
-            // An outbox would atomically persist the publish intent with the transfer to close this crash window.
+            
+            // Note: For absolute guarantees against publisher crashes, pair this with a Transactional Outbox pattern
             await publisher.PublishAsync(outgoing, cancellationToken);
             await publisher.PublishAsync(incoming, cancellationToken);
+            
             return result;
         }
         catch (DbUpdateException exception) when (IsUniqueViolation(exception))
@@ -136,13 +148,18 @@ public sealed class TransferService(
     {
         var stored = await dbContext.IdempotencyKeys.AsNoTracking()
             .SingleOrDefaultAsync(entry => entry.Key == key, cancellationToken);
+            
         if (stored is null)
             return null;
+            
+        // 3. Cryptographic tamper detection ensures payload hasn't changed under the same key
         if (!CryptographicOperations.FixedTimeEquals(
                 Convert.FromHexString(stored.RequestHash), Convert.FromHexString(requestHash)))
             throw new UnprocessableException("Idempotency key was already used for a different request.");
+            
         var response = JsonSerializer.Deserialize<ApiResponse<TransferReceipt>>(stored.ResponseBody)
             ?? throw new InvalidOperationException("Stored idempotency response is invalid.");
+            
         return (response.Data, stored.StatusCode);
     }
 
@@ -161,9 +178,11 @@ public sealed class TransferService(
     {
         var cached = JsonSerializer.Deserialize<CachedResult>(value)
             ?? throw new InvalidOperationException("Cached idempotency response is invalid.");
+            
         if (!CryptographicOperations.FixedTimeEquals(
                 Convert.FromHexString(cached.RequestHash), Convert.FromHexString(requestHash)))
             throw new UnprocessableException("Idempotency key was already used for a different request.");
+            
         return (cached.Receipt, cached.StatusCode);
     }
 
